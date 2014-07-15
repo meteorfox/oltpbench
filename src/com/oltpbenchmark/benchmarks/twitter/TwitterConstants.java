@@ -16,7 +16,7 @@ public abstract class TwitterConstants {
     /**
      * Number of tweets baseline
      */
-    public static final int NUM_TWEETS = 20000; 
+    public static final int NUM_TWEETS = 2000;
     
     /**
      * Max follow per user baseline
