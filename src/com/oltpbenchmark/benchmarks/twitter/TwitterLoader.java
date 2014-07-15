@@ -5,6 +5,8 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.apache.log4j.Logger;
 
@@ -21,8 +23,11 @@ import com.oltpbenchmark.util.TextGenerator;
 
 public class TwitterLoader extends Loader {
     private static final Logger LOG = Logger.getLogger(TwitterLoader.class);
-
+    public final static int configThreadCount = 50;
     public final static int configCommitCount = 1000;
+
+    private static final ExecutorService service =
+            Executors.newFixedThreadPool(configThreadCount);
 
     private final int num_users;
     private final long num_tweets;
@@ -30,9 +35,10 @@ public class TwitterLoader extends Loader {
 
     public TwitterLoader(TwitterBenchmark benchmark, Connection c) {
         super(benchmark, c);
+
         this.num_users = (int)Math.round(TwitterConstants.NUM_USERS * this.scaleFactor);
-        this.num_tweets = (int)Math.round(TwitterConstants.NUM_TWEETS);
-        this.num_follows = (int)Math.round(TwitterConstants.MAX_FOLLOW_PER_USER);
+        this.num_tweets = (int)Math.round(TwitterConstants.NUM_TWEETS * this.scaleFactor);
+        this.num_follows = (int) Math.round(TwitterConstants.MAX_FOLLOW_PER_USER);
         if (LOG.isDebugEnabled()) {
             LOG.debug("# of USERS:  " + this.num_users);
             LOG.debug("# of TWEETS: " + this.num_tweets);
@@ -99,44 +105,74 @@ public class TwitterLoader extends Loader {
      * @throws SQLException
      */
     protected void loadTweets() throws SQLException {
-        Table catalog_tbl = this.getTableCatalog(TwitterConstants.TABLENAME_TWEETS);
+        final Table catalog_tbl = this.getTableCatalog(TwitterConstants.TABLENAME_TWEETS);
         assert(catalog_tbl != null);
-        String sql = SQLUtil.getInsertSQL(catalog_tbl);
-        PreparedStatement tweetInsert = this.conn.prepareStatement(sql);
-        
-        int total = 0;
-        int batchSize = 0;
-        ScrambledZipfianGenerator zy = new ScrambledZipfianGenerator(this.num_users);
-        
-        TweetHistogram tweet_h = new TweetHistogram();
-        FlatHistogram<Integer> tweet_len_rng = new FlatHistogram<Integer>(this.rng(), tweet_h);
-        
-        for (long i = 0; i < this.num_tweets; i++) {
-            int uid = zy.nextInt();
-            tweetInsert.setLong(1, i);
-            tweetInsert.setInt(2, uid);
-            tweetInsert.setString(3, TextGenerator.randomStr(rng(), tweet_len_rng.nextValue()));
-            tweetInsert.setNull(4, java.sql.Types.DATE);
-            tweetInsert.addBatch();
-            batchSize++;
-            total++;
 
-            if ((batchSize % configCommitCount) == 0) {
-                tweetInsert.executeBatch();
-                conn.commit();
-                tweetInsert.clearBatch();            
-                batchSize = 0;
-                if (LOG.isDebugEnabled()) 
-                    LOG.debug("tweet % " + total + "/"+this.num_tweets);
-            }
+        long partitionSize = this.num_tweets / TwitterLoader.configThreadCount;
+
+        List<List<Long>> tweetid_partitions = groupRange(0L, this.num_tweets, partitionSize);
+
+        for (final List<Long> partition : tweetid_partitions) {
+            service.submit(new Runnable() {
+                @Override
+                public void run() {
+                    ScrambledZipfianGenerator zy = new ScrambledZipfianGenerator(num_users);
+
+                    TweetHistogram tweet_h = new TweetHistogram();
+
+                    FlatHistogram<Integer> tweet_len_rng =
+                            new FlatHistogram<>(rng(), tweet_h);
+
+                    String sql = SQLUtil.getInsertSQL(catalog_tbl);
+                    PreparedStatement tweetInsert = null;
+
+                    try {
+                        tweetInsert = conn.prepareStatement(sql);
+                        int total = 0;
+                        int batchSize = 0;
+
+                        for (Long i : partition) {
+                            int uid = zy.nextInt();
+                            tweetInsert.setLong(1, i);
+                            tweetInsert.setInt(2, uid);
+                            tweetInsert.setString(3, TextGenerator.randomStr(rng(),
+                                    tweet_len_rng.nextValue()));
+
+                            tweetInsert.setNull(4, java.sql.Types.DATE);
+                            tweetInsert.addBatch();
+                            batchSize++;
+                            total++;
+
+                            if ((batchSize % configCommitCount) == 0) {
+                                tweetInsert.executeBatch();
+                                conn.commit();
+                                tweetInsert.clearBatch();
+                                batchSize = 0;
+                                if (LOG.isDebugEnabled())
+                                    LOG.debug("tweet % " + total + "/"+ num_tweets);
+                            }
+                        }
+                        if (batchSize > 0) {
+                            tweetInsert.executeBatch();
+                            conn.commit();
+                        }
+
+                        tweetInsert.close();
+
+                        if (LOG.isDebugEnabled())
+                            LOG.debug("[Tweets Loaded] "+ num_tweets);
+
+                    } catch (SQLException e) {
+                        e.printStackTrace();
+                    }
+
+
+
+                }
+            });
         }
-        if (batchSize > 0) {
-            tweetInsert.executeBatch();
-            conn.commit();
-        }
-        tweetInsert.close();
-        if (LOG.isDebugEnabled()) 
-            LOG.debug("[Tweets Loaded] "+ this.num_tweets);
+
+
     }
     
     /**
@@ -214,5 +250,30 @@ public class TwitterLoader extends Loader {
         this.loadUsers();
         this.loadTweets();
         this.loadFollowData();
+    }
+
+    public static List<List<Long>> groupRange(long start, long end, long partitionSize) {
+        final List<List<Long>> partitions = new ArrayList<>();
+
+        List<Long> chunk = new ArrayList<>();
+        for (long i = start; i < end; i++) {
+            chunk.add(i);
+
+            if (chunk.size() == partitionSize) {
+                partitions.add(chunk);
+                chunk = new ArrayList<>();
+            }
+        }
+
+        if (!chunk.isEmpty()) {
+            partitions.add(chunk);
+        }
+
+        return partitions;
+    }
+
+    public static void main(String[] args) {
+        final List<List<Long>> parts = groupRange(0, 100, 5);
+        System.out.println(parts);
     }
 }
